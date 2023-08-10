@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"strings"
 	"sync"
 
+	"github.com/cppforlife/go-cli-ui/ui"
 	helmclient "github.com/operator-framework/helm-operator-plugins/pkg/client"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
@@ -21,10 +23,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	apimachyaml "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,11 +36,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+	"sigs.k8s.io/yaml"
 
 	rukpakv1alpha1 "github.com/operator-framework/rukpak/api/v1alpha1"
-	helmpredicate "github.com/operator-framework/rukpak/internal/helm-operator-plugins/predicate"
+	"github.com/operator-framework/rukpak/internal/helm-operator-plugins/predicate"
 	"github.com/operator-framework/rukpak/internal/util"
 	"github.com/operator-framework/rukpak/pkg/storage"
+	"github.com/vmware-tanzu/carvel-kapp/pkg/kapp/cmd/app"
+	"github.com/vmware-tanzu/carvel-kapp/pkg/kapp/cmd/core"
+	"github.com/vmware-tanzu/carvel-kapp/pkg/kapp/logger"
 )
 
 /*
@@ -247,147 +254,68 @@ func (c *controller) reconcile(ctx context.Context, bd *rukpakv1alpha1.BundleDep
 		})
 		return ctrl.Result{}, err
 	}
-
-	chrt, values, err := c.handler.Handle(ctx, bundleFS, bd)
-	if err != nil {
-		meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-			Type:    rukpakv1alpha1.TypeHasValidBundle,
-			Status:  metav1.ConditionFalse,
-			Reason:  rukpakv1alpha1.ReasonBundleLoadFailed,
-			Message: err.Error(),
-		})
-		return ctrl.Result{}, err
-	}
-
-	bd.SetNamespace(c.releaseNamespace)
-	cl, err := c.acg.ActionClientFor(bd)
-	bd.SetNamespace("")
-	if err != nil {
-		meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-			Type:    rukpakv1alpha1.TypeInstalled,
-			Status:  metav1.ConditionFalse,
-			Reason:  rukpakv1alpha1.ReasonErrorGettingClient,
-			Message: err.Error(),
-		})
-		return ctrl.Result{}, err
-	}
-
-	post := &postrenderer{
-		labels: map[string]string{
-			util.CoreOwnerKindKey: rukpakv1alpha1.BundleDeploymentKind,
-			util.CoreOwnerNameKey: bd.GetName(),
+	mFS := &mutatingFS{
+		delegate:    bundleFS,
+		handleScope: meta.RESTScopeNameRoot,
+		getScope: func(gvk schema.GroupVersionKind) (meta.RESTScope, error) {
+			mapping, err := c.cl.RESTMapper().RESTMapping(gvk.GroupKind(), gvk.Version)
+			if err != nil {
+				return nil, err
+			}
+			return mapping.Scope, nil
 		},
-	}
-
-	rel, state, err := c.getReleaseState(cl, bd, chrt, values, post)
-	if err != nil {
-		meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-			Type:    rukpakv1alpha1.TypeInstalled,
-			Status:  metav1.ConditionFalse,
-			Reason:  rukpakv1alpha1.ReasonErrorGettingReleaseState,
-			Message: err.Error(),
-		})
-		return ctrl.Result{}, err
-	}
-
-	switch state {
-	case stateNeedsInstall:
-		rel, err = cl.Install(bd.Name, c.releaseNamespace, chrt, values, func(install *action.Install) error {
-			install.CreateNamespace = false
-			return nil
+		mutate: func(u *unstructured.Unstructured) (bool, error) {
+			l := u.GetLabels()
+			if l == nil {
+				l = make(map[string]string)
+			}
+			l[util.CoreOwnerKindKey] = rukpakv1alpha1.BundleDeploymentKind
+			l[util.CoreOwnerNameKey] = bd.Name
+			u.SetLabels(l)
+			u.SetOwnerReferences([]metav1.OwnerReference{
+				{
+					APIVersion: rukpakv1alpha1.GroupVersion.String(),
+					Kind:       "BundleDeployment",
+					Name:       bd.Name,
+					UID:        bd.UID,
+					Controller: pointer.Bool(true),
+				},
+			})
+			return true, nil
 		},
-			// To be refactored issue https://github.com/operator-framework/rukpak/issues/534
-			func(install *action.Install) error {
-				post.cascade = install.PostRenderer
-				install.PostRenderer = post
-				return nil
-			})
-		if err != nil {
-			if isResourceNotFoundErr(err) {
-				err = errRequiredResourceNotFound{err}
-			}
-			meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-				Type:    rukpakv1alpha1.TypeInstalled,
-				Status:  metav1.ConditionFalse,
-				Reason:  rukpakv1alpha1.ReasonInstallFailed,
-				Message: err.Error(),
-			})
-			return ctrl.Result{}, err
-		}
-	case stateNeedsUpgrade:
-		rel, err = cl.Upgrade(bd.Name, c.releaseNamespace, chrt, values,
-			// To be refactored issue https://github.com/operator-framework/rukpak/issues/534
-			func(upgrade *action.Upgrade) error {
-				post.cascade = upgrade.PostRenderer
-				upgrade.PostRenderer = post
-				return nil
-			})
-		if err != nil {
-			if isResourceNotFoundErr(err) {
-				err = errRequiredResourceNotFound{err}
-			}
-			meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-				Type:    rukpakv1alpha1.TypeInstalled,
-				Status:  metav1.ConditionFalse,
-				Reason:  rukpakv1alpha1.ReasonUpgradeFailed,
-				Message: err.Error(),
-			})
-			return ctrl.Result{}, err
-		}
-	case stateUnchanged:
-		if err := cl.Reconcile(rel); err != nil {
-			if isResourceNotFoundErr(err) {
-				err = errRequiredResourceNotFound{err}
-			}
-			meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-				Type:    rukpakv1alpha1.TypeInstalled,
-				Status:  metav1.ConditionFalse,
-				Reason:  rukpakv1alpha1.ReasonReconcileFailed,
-				Message: err.Error(),
-			})
-			return ctrl.Result{}, err
-		}
-	default:
-		return ctrl.Result{}, fmt.Errorf("unexpected release state %q", state)
+		gvks: make(sets.Set[schema.GroupVersionKind]),
 	}
 
-	relObjects, err := util.ManifestObjects(strings.NewReader(rel.Manifest), fmt.Sprintf("%s-release-manifest", rel.Name))
-	if err != nil {
-		meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-			Type:    rukpakv1alpha1.TypeInstalled,
-			Status:  metav1.ConditionFalse,
-			Reason:  rukpakv1alpha1.ReasonCreateDynamicWatchFailed,
-			Message: err.Error(),
-		})
+	if err := c.deployOne(ctx, bd.Name+"-cluster", mFS); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	for _, obj := range relObjects {
-		uMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
-		if err != nil {
-			meta.SetStatusCondition(&bd.Status.Conditions, metav1.Condition{
-				Type:    rukpakv1alpha1.TypeInstalled,
-				Status:  metav1.ConditionFalse,
-				Reason:  rukpakv1alpha1.ReasonCreateDynamicWatchFailed,
-				Message: err.Error(),
-			})
-			return ctrl.Result{}, err
-		}
+	gvks := mFS.gvks
+	mFS.gvks = make(sets.Set[schema.GroupVersionKind])
+	mFS.handleScope = meta.RESTScopeNameNamespace
 
-		unstructuredObj := &unstructured.Unstructured{Object: uMap}
+	if err := c.deployOne(ctx, bd.Name, mFS); err != nil {
+		return ctrl.Result{}, err
+	}
+	gvks = gvks.Union(mFS.gvks)
+
+	for _, gvk := range gvks.UnsortedList() {
 		if err := func() error {
 			c.dynamicWatchMutex.Lock()
 			defer c.dynamicWatchMutex.Unlock()
 
-			_, isWatched := c.dynamicWatchGVKs[unstructuredObj.GroupVersionKind()]
+			_, isWatched := c.dynamicWatchGVKs[gvk]
 			if !isWatched {
+				u := &unstructured.Unstructured{}
+				u.SetAPIVersion(gvk.GroupVersion().String())
+				u.SetKind(gvk.Kind)
 				if err := c.controller.Watch(
-					&source.Kind{Type: unstructuredObj},
+					&source.Kind{Type: u},
 					&handler.EnqueueRequestForOwner{OwnerType: bd, IsController: true},
-					helmpredicate.DependentPredicateFuncs()); err != nil {
+					predicate.DependentPredicateFuncs()); err != nil {
 					return err
 				}
-				c.dynamicWatchGVKs[unstructuredObj.GroupVersionKind()] = struct{}{}
+				c.dynamicWatchGVKs[gvk] = struct{}{}
 			}
 			return nil
 		}(); err != nil {
@@ -413,6 +341,45 @@ func (c *controller) reconcile(ctx context.Context, bd *rukpakv1alpha1.BundleDep
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (c *controller) deployOne(ctx context.Context, bundleDeploymentName string, fsys fs.FS) error {
+	theUI := ui.NewConfUI(ui.NewNoopLogger())
+	theUI.EnableNonInteractive()
+
+	configFactory := core.NewConfigFactoryImpl()
+	configFactory.ConfigurePathResolver(func() (string, error) {
+		return "", nil
+	})
+	configFactory.ConfigureContextResolver(func() (string, error) {
+		return "", nil
+	})
+	configFactory.ConfigureYAMLResolver(func() (string, error) {
+		return "", nil
+	})
+	configFactory.ConfigureClient(100, 200)
+
+	depsFactory := core.NewDepsFactoryImpl(configFactory, theUI)
+	log := logger.NewUILogger(theUI)
+
+	deployOptions := app.NewDeployOptions(theUI, depsFactory, log)
+	deployOptions.AppFlags.NamespaceFlags.Name = "default"
+	deployOptions.AppFlags.Name = bundleDeploymentName
+	deployOptions.FileFlags.Files = []string{"manifests"}
+	deployOptions.FileSystem = fsys
+
+	flagsFactory := core.NewFlagsFactory(configFactory, depsFactory)
+
+	deployCmd := app.NewDeployCmd(deployOptions, flagsFactory)
+	deployCmd.DisableFlagParsing = true
+
+	kl := ctrl.LoggerFrom(ctx)
+
+	if err := deployCmd.Execute(); err != nil {
+		kl.Error(err, "error executing kapp deploy cmd")
+		return err
+	}
+	return nil
 }
 
 // reconcileOldBundles is responsible for garbage collecting any Bundles
@@ -530,4 +497,54 @@ func (p *postrenderer) Run(renderedManifests *bytes.Buffer) (*bytes.Buffer, erro
 		return p.cascade.Run(&buf)
 	}
 	return &buf, nil
+}
+
+type mutatingFS struct {
+	delegate    fs.FS
+	mutate      func(u *unstructured.Unstructured) (bool, error)
+	gvks        sets.Set[schema.GroupVersionKind]
+	getScope    func(gvk schema.GroupVersionKind) (meta.RESTScope, error)
+	handleScope meta.RESTScopeName
+}
+
+func (f *mutatingFS) Open(name string) (fs.File, error) {
+	return f.delegate.Open(name)
+}
+
+func (f *mutatingFS) Stat(name string) (fs.FileInfo, error) {
+	return f.delegate.(fs.StatFS).Stat(name)
+}
+
+func (f *mutatingFS) ReadFile(path string) ([]byte, error) {
+	out, err := f.delegate.(fs.ReadFileFS).ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	m := make(map[string]interface{})
+	if err := yaml.Unmarshal(out, &m); err != nil {
+		return nil, err
+	}
+
+	u := &unstructured.Unstructured{Object: m}
+	scope, err := f.getScope(u.GroupVersionKind())
+	if err != nil {
+		return nil, err
+	}
+
+	if scope.Name() != f.handleScope {
+		return []byte{}, nil
+	}
+
+	f.gvks.Insert(u.GroupVersionKind())
+
+	modified, err := f.mutate(u)
+	if err != nil {
+		return nil, err
+	}
+	if !modified {
+		return out, nil
+	}
+
+	return yaml.Marshal(u)
 }
